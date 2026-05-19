@@ -33,9 +33,28 @@ except ImportError:
 # 东八区时区（北京时间）
 CHINA_TZ = timezone(timedelta(hours=8))
 from urllib.parse import urlparse
+from email.utils import parsedate_to_datetime
 
 # 元数据缓存配置（基于版本号的永久缓存）
 _metadata_cache = {}  # {cache_key: {'data': {...}, 'version_id': str}}
+
+
+def _format_lanhu_rfc2822(value: Optional[str]) -> Optional[str]:
+    """把蓝湖 /api/project/product_documents 等端点返回的 RFC 2822 时间
+    (如 'Fri, 09 Jan 2026 10:07:29 GMT') 转成 '%Y-%m-%d %H:%M:%S' 中国时区字符串。
+
+    与 _fetch_metadata_from_url 中的 ISO8601 处理风格保持一致。
+    失败时原样返回，None 返回 None。
+    """
+    if not value:
+        return None
+    try:
+        dt = parsedate_to_datetime(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(CHINA_TZ).strftime('%Y-%m-%d %H:%M:%S')
+    except Exception:
+        return value
 
 import httpx
 from fastmcp import Context
@@ -2280,6 +2299,7 @@ def get_user_info(ctx: Context) -> tuple:
     从URL query参数获取用户信息
     
     MCP连接URL格式：http://xxx:port/mcp?role=后端&name=张三
+    stdio模式可通过 LANHU_USER_NAME 和 LANHU_USER_ROLE 环境变量获取
     """
     try:
         # 使用 FastMCP 提供的 get_http_request 获取当前请求
@@ -2292,7 +2312,7 @@ def get_user_info(ctx: Context) -> tuple:
         return name, role
     except Exception:
         pass
-    return '匿名', '未知'
+    return os.getenv('LANHU_USER_NAME', '匿名'), os.getenv('LANHU_USER_ROLE', '未知')
 
 
 def _clean_message_dict(msg: dict, current_user_name: str = None) -> dict:
@@ -2530,6 +2550,56 @@ class LanhuExtractor:
             raise Exception(f"API Error: {data.get('msg')} (code={code})")
 
         return data.get('data') or data.get('result', {})
+
+    async def list_product_documents(self, team_id: str, project_id: str) -> dict:
+        """获取项目下的所有产品文档(PRD/原型)列表。
+
+        调用端点: GET /api/project/product_documents?team_id=xxx&project_id=xxx
+
+        返回精简后的结构，仅保留对 AI 有意义的字段、规范化时间格式，
+        并为每个文档预拼好 `doc_url`，便于直接喂给 lanhu_get_pages。
+        """
+        api_url = f"{BASE_URL}/api/project/product_documents"
+        params = {'team_id': team_id, 'project_id': project_id}
+
+        response = await self.client.get(api_url, params=params)
+        response.raise_for_status()
+
+        data = response.json()
+        code = data.get('code')
+        success = (code == 0 or code == '0' or code == '00000')
+
+        if not success:
+            raise Exception(f"API Error: {data.get('msg')} (code={code})")
+
+        result = data.get('data') or data.get('result') or {}
+
+        documents = []
+        for item in result.get('resources') or []:
+            doc_id = item.get('id')
+            if not doc_id:
+                continue
+            documents.append({
+                'doc_id': doc_id,
+                'name': item.get('name'),
+                'type': item.get('type', 'axure'),
+                'last_version_num': item.get('last_version_num'),
+                'latest_version': item.get('latest_version'),
+                'create_time': _format_lanhu_rfc2822(item.get('create_time')),
+                'update_time': _format_lanhu_rfc2822(item.get('update_time')),
+                'doc_url': (
+                    f"{BASE_URL}/web/#/item/project/product"
+                    f"?tid={team_id}&pid={project_id}&docId={doc_id}"
+                ),
+            })
+
+        return {
+            'default_group_id': result.get('default_group_id'),
+            'doc_can_download': result.get('doc_can_download'),
+            'need_group': result.get('need_group'),
+            'total': len(documents),
+            'documents': documents,
+        }
 
     def _get_cache_meta_path(self, output_dir: Path) -> Path:
         """获取缓存元数据文件路径"""
@@ -4077,6 +4147,35 @@ def _get_analysis_mode_options_by_role(user_role: str) -> str:
 
 
 @mcp.tool()
+async def lanhu_list_product_documents(
+    url: Annotated[str, "Lanhu project URL. Example: https://lanhuapp.com/web/#/item/project/product?tid=xxx&pid=xxx (docId optional, will be ignored). Required params: tid, pid. If you have an invite link, use lanhu_resolve_invite_link first!"],
+    ctx: Context = None
+) -> dict:
+    """
+    [PRD/Requirement Document Discovery] List all product documents (PRD/prototype) in a Lanhu project.
+
+    USE THIS WHEN user says: 有哪些需求文档, 列出项目的文档, 项目下的PRD列表, 产品文档列表,
+        这个项目有什么文档, 文档列表, list documents, product_documents, 所有文档, 全部 PRD
+    DO NOT USE for: 获取某个具体文档的页面 (use lanhu_get_pages instead),
+        UI设计图列表 (use lanhu_get_designs instead)
+
+    Purpose: Discover available PRD/requirement documents in a project so the user can pick
+        the right one to analyze. Typically used BEFORE lanhu_get_pages when docId is unknown.
+
+    Returns a dict with top-level metadata and a simplified `documents` list. Each document
+    carries a ready-to-use `doc_url` that can be fed straight into lanhu_get_pages.
+    """
+    extractor = LanhuExtractor()
+    try:
+        params = extractor.parse_url(url)
+        team_id = params.get('team_id')
+        project_id = params.get('project_id')
+        return await extractor.list_product_documents(team_id, project_id)
+    finally:
+        await extractor.close()
+
+
+@mcp.tool()
 async def lanhu_get_pages(
     url: Annotated[str, "Lanhu URL with docId parameter (indicates PRD/prototype document). Example: https://lanhuapp.com/web/#/item/project/product?tid=xxx&pid=xxx&docId=xxx. Required param: pid. tid and docId recommended. Supports detailDetach format: ?pid=xxx&image_id=xxx. If you have an invite link, use lanhu_resolve_invite_link first!"],
     ctx: Context = None
@@ -4993,6 +5092,65 @@ async def lanhu_get_ai_analyze_page_result(
         await extractor.close()
 
 
+def _normalize_design_sectors(sectors: List[dict]) -> tuple[List[dict], dict[str, List[dict]]]:
+    """规范化蓝湖 project_sectors 返回，并建立 image_id -> sectors 映射。"""
+    sector_by_id = {}
+    for sector in sectors or []:
+        sector_id = sector.get('id')
+        if sector_id:
+            sector_by_id[sector_id] = sector
+
+    sector_path_cache = {}
+
+    def build_sector_path(sector_id: str, trail: Optional[set[str]] = None) -> str:
+        if not sector_id:
+            return ""
+        if sector_id in sector_path_cache:
+            return sector_path_cache[sector_id]
+
+        sector = sector_by_id.get(sector_id, {})
+        sector_name = sector.get('name') or sector_id
+        parent_id = sector.get('parent_id') or ""
+        trail = trail or set()
+
+        if sector_id in trail:
+            return sector_name
+
+        if parent_id and parent_id in sector_by_id:
+            parent_path = build_sector_path(parent_id, trail | {sector_id})
+            path = f"{parent_path}/{sector_name}" if parent_path else sector_name
+        else:
+            path = sector_name
+
+        sector_path_cache[sector_id] = path
+        return path
+
+    normalized_sectors = []
+    image_sector_map = {}
+
+    for sector in sectors or []:
+        sector_id = sector.get('id')
+        if not sector_id:
+            continue
+
+        normalized_sector = {
+            'id': sector_id,
+            'parent_id': sector.get('parent_id') or None,
+            'name': sector.get('name'),
+            'path': build_sector_path(sector_id),
+            'order': sector.get('order', 0),
+            'image_count': len(sector.get('images') or [])
+        }
+        normalized_sectors.append(normalized_sector)
+
+        for image_id in sector.get('images') or []:
+            if not image_id:
+                continue
+            image_sector_map.setdefault(image_id, []).append(dict(normalized_sector))
+
+    return normalized_sectors, image_sector_map
+
+
 async def _get_designs_internal(extractor: LanhuExtractor, url: str) -> dict:
     """内部函数：获取设计图列表"""
     # 解析URL获取参数
@@ -5006,6 +5164,28 @@ async def _get_designs_internal(extractor: LanhuExtractor, url: str) -> dict:
     if params['team_id']:
         api_url += f"&team_id={params['team_id']}"
     api_url += f"&dds_status=1&position=1&show_cb_src=1&comment=1"
+
+    sector_list = []
+    image_sector_map = {}
+    sector_warning = None
+
+    try:
+        sector_api_url = (
+            f"https://lanhuapp.com/api/project/project_sectors"
+            f"?project_id={params['project_id']}"
+        )
+        sector_response = await extractor.client.get(sector_api_url)
+        sector_response.raise_for_status()
+        sector_data = sector_response.json()
+
+        if sector_data.get('code') == '00000':
+            sector_list, image_sector_map = _normalize_design_sectors(
+                sector_data.get('data', {}).get('sectors', [])
+            )
+        else:
+            sector_warning = sector_data.get('msg', 'Unknown error')
+    except Exception as e:
+        sector_warning = str(e)
 
     # 发送请求
     response = await extractor.client.get(api_url)
@@ -5024,6 +5204,7 @@ async def _get_designs_internal(extractor: LanhuExtractor, url: str) -> dict:
 
     design_list = []
     for idx, img in enumerate(images, 1):
+        design_sectors = image_sector_map.get(img.get('id'), [])
         design_list.append({
             'index': idx,
             'id': img.get('id'),
@@ -5032,15 +5213,24 @@ async def _get_designs_internal(extractor: LanhuExtractor, url: str) -> dict:
             'height': img.get('height'),
             'url': img.get('url'),
             'has_comment': img.get('has_comment', False),
-            'update_time': img.get('update_time')
+            'update_time': img.get('update_time'),
+            'sectors': [sector.get('name') for sector in design_sectors if sector.get('name')]
         })
 
-    return {
+    result = {
         'status': 'success',
         'project_name': project_data.get('name'),
+        'total_sectors': len(sector_list),
+        'ungrouped_design_count': sum(1 for design in design_list if not design.get('sectors')),
+        'sectors': sector_list,
         'total_designs': len(design_list),
         'designs': design_list
     }
+
+    if sector_warning:
+        result['sector_warning'] = f"Failed to load project sectors: {sector_warning}"
+
+    return result
 
 
 @mcp.tool()
@@ -5276,7 +5466,12 @@ async def lanhu_get_ai_analyze_design_result(
                         break
 
         if not target_designs:
-            available_names = [d['name'] for d in designs]
+            available_names = []
+            for design in designs:
+                if design.get('sectors'):
+                    available_names.append(f"{design['name']} [{', '.join(design['sectors'])}]")
+                else:
+                    available_names.append(design['name'])
             return [
                 f"⚠️ No matching design found\n\nAvailable designs:\n" + "\n".join(f"  • {name}" for name in available_names)]
 
@@ -5289,6 +5484,9 @@ async def lanhu_get_ai_analyze_design_result(
         html_results = []
         
         for design in target_designs:
+            # 文件名中的 / 替换为 _ 避免路径问题（display name 保留原始值）
+            safe_design_name = design['name'].replace('/', '_')
+
             # ===== 1. 下载图片 =====
             try:
                 # 获取原图URL（去掉OSS处理参数）
@@ -5309,12 +5507,14 @@ async def lanhu_get_ai_analyze_design_result(
                     'success': True,
                     'design_name': design['name'],
                     'design_id': design['id'],
+                    'sectors': design.get('sectors', []),
                     'screenshot_path': str(img_filepath)
                 })
             except Exception as e:
                 image_results.append({
                     'success': False,
                     'design_name': design['name'],
+                    'sectors': design.get('sectors', []),
                     'error': str(e)
                 })
             
@@ -5507,6 +5707,8 @@ async def lanhu_get_ai_analyze_design_result(
         
         for idx, img_r in enumerate(success_image_results, 1):
             summary_text += f"\n--- 设计图 {idx}：{img_r['design_name']} ---\n"
+            if img_r.get('sectors'):
+                summary_text += f"   🗂️ 所属分组: {'；'.join(img_r['sectors'])}\n"
 
             html_r = success_html_results.get(img_r['design_name'])
             if html_r:
@@ -6562,15 +6764,12 @@ async def lanhu_get_members(
 
 
 if __name__ == "__main__":
-    # 运行MCP服务器，支持环境变量切换传输方式
-    # MCP_TRANSPORT=stdio 时使用 stdio 模式（Claude Code 直接 spawn）
-    # MCP_TRANSPORT=http 或默认时使用 HTTP 模式（独立服务器）
-    MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "http")
+    # 运行MCP服务器
+    # 默认使用HTTP传输；设置 MCP_TRANSPORT=stdio 时可由MCP客户端按需拉起。
+    MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "http").lower()
     if MCP_TRANSPORT == "stdio":
         mcp.run(transport="stdio")
     else:
         SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
         SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
         mcp.run(transport="http", path="/mcp", host=SERVER_HOST, port=SERVER_PORT)
-
-
