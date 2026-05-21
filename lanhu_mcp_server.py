@@ -2536,6 +2536,13 @@ class LanhuExtractor:
 
     async def get_document_info(self, project_id: str, doc_id: str) -> dict:
         """获取文档信息"""
+        if not doc_id:
+            raise ValueError(
+                "URL 缺少 docId（或 image_id）参数，无法定位 PRD/原型文档。"
+                "请先调用 lanhu_list_product_documents 获取 doc_url，"
+                "或使用带 docId 的链接，例如："
+                ".../item/project/product?tid=xxx&pid=xxx&docId=xxx"
+            )
         api_url = f"{BASE_URL}/api/project/image"
         params = {'pid': project_id, 'image_id': doc_id}
 
