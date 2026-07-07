@@ -2392,8 +2392,16 @@ async def _fetch_metadata_from_url(url: str) -> dict:
         # 如果有doc_id，获取文档信息和版本号
         version_id = None
         if doc_id:
-            doc_info = await extractor.get_document_info(project_id, doc_id)
-            
+            doc_info = await extractor.get_document_info(
+                project_id, doc_id, team_id=team_id, page_id=params.get('page_id')
+            )
+
+            # docId 失效已被兜底迁移：用当前有效 docId 校正元数据与缓存键
+            if doc_info.get('_relocated_to_doc_id'):
+                doc_id = doc_info['_relocated_to_doc_id']
+                metadata['doc_id'] = doc_id
+                cache_key = _get_metadata_cache_key(project_id, doc_id)
+
             # 获取版本ID
             versions = doc_info.get('versions', [])
             if versions:
@@ -2456,6 +2464,18 @@ async def _fetch_metadata_from_url(url: str) -> dict:
     
     return metadata
 
+
+
+class _ImageNotExistError(Exception):
+    """/api/project/image 返回 10009 (Image not exist) 时抛出。
+
+    通常意味着文档被重新上传/替换，URL 里冻结的旧 docId 已失效——
+    这是邀请链接/收藏链接"拿不到内容"的最常见根因。
+    """
+
+    def __init__(self, doc_id: str):
+        self.doc_id = doc_id
+        super().__init__(f"Image not exist (code=10009), doc_id={doc_id}")
 
 
 class LanhuExtractor:
@@ -2522,6 +2542,9 @@ class LanhuExtractor:
         project_id = params.get('pid')
         doc_id = params.get('docId') or params.get('image_id')
         version_id = params.get('versionId')
+        # pageId 跨文档版本保持稳定：文档被替换后 docId/versionId 会变，
+        # 但 pageId 仍能在新文档的 sitemap 中命中，可用于兜底消歧
+        page_id = params.get('pageId')
 
         # 验证必需参数（pid 是唯一必需的，tid 可选 — detailDetach 等格式不含 tid）
         if not project_id:
@@ -2531,11 +2554,32 @@ class LanhuExtractor:
             'team_id': team_id,
             'project_id': project_id,
             'doc_id': doc_id,
-            'version_id': version_id
+            'version_id': version_id,
+            'page_id': page_id
         }
 
-    async def get_document_info(self, project_id: str, doc_id: str) -> dict:
-        """获取文档信息"""
+    async def get_document_info(self, project_id: str, doc_id: str,
+                                team_id: str = None, page_id: str = None) -> dict:
+        """获取文档信息。
+
+        当文档被重新上传/替换后，URL 里冻结的旧 docId 会失效，蓝湖 API 返回
+        10009 (Image not exist)。此时若提供了 team_id，会自动通过
+        product_documents 查找项目内当前有效的 axure 文档并重试：
+
+        - 项目内仅 1 个 axure 文档：直接采用
+        - 多个 axure 文档且提供了 page_id：按 pageId 跨版本稳定特性消歧
+        - 否则抛出含候选清单的明确错误，引导用户用 lanhu_list_product_documents 选定
+
+        Args:
+            project_id: 项目 ID (pid)
+            doc_id: 文档 ID (docId / image_id)，可能已失效
+            team_id: 团队 ID (tid)，兜底必需；None 时不做兜底
+            page_id: 页面 ID (pageId)，多文档场景用于消歧
+
+        Returns:
+            文档信息 dict。若发生过 docId 迁移，会额外带：
+            _relocated_from_doc_id / _relocated_to_doc_id
+        """
         if not doc_id:
             raise ValueError(
                 "URL 缺少 docId（或 image_id）参数，无法定位 PRD/原型文档。"
@@ -2543,20 +2587,121 @@ class LanhuExtractor:
                 "或使用带 docId 的链接，例如："
                 ".../item/project/product?tid=xxx&pid=xxx&docId=xxx"
             )
-        api_url = f"{BASE_URL}/api/project/image"
-        params = {'pid': project_id, 'image_id': doc_id}
 
-        response = await self.client.get(api_url, params=params)
+        try:
+            return await self._fetch_image_info(project_id, doc_id)
+        except _ImageNotExistError:
+            if not team_id:
+                # 没有 team_id 无法调用 product_documents 兜底
+                raise Exception(
+                    f"API Error: Image not exist (code=10009)，docId={doc_id} 已失效。"
+                    "该 URL 未携带 team_id，无法自动定位当前文档。"
+                    "请使用带 tid 与 docId 的链接，或先调用 lanhu_list_product_documents 选定文档。"
+                )
+            current_doc_id = await self._find_current_axure_doc_id(
+                project_id, team_id, page_id=page_id
+            )
+            info = await self._fetch_image_info(project_id, current_doc_id)
+            info['_relocated_from_doc_id'] = doc_id
+            info['_relocated_to_doc_id'] = current_doc_id
+            return info
+
+    async def _fetch_image_info(self, project_id: str, doc_id: str) -> dict:
+        """调用 /api/project/image 获取文档信息（无兜底）。
+
+        Raises:
+            _ImageNotExistError: API 返回 10009 (Image not exist)
+            Exception: 其他 API/网络错误
+        """
+        api_url = f"{BASE_URL}/api/project/image"
+        response = await self.client.get(api_url, params={'pid': project_id, 'image_id': doc_id})
         response.raise_for_status()
 
         data = response.json()
         code = data.get('code')
-        success = (code == 0 or code == '0' or code == '00000')
+        if code == 0 or code == '0' or code == '00000':
+            return data.get('data') or data.get('result', {})
+        if str(code) == '10009':
+            raise _ImageNotExistError(doc_id)
+        raise Exception(f"API Error: {data.get('msg')} (code={code})")
 
-        if not success:
-            raise Exception(f"API Error: {data.get('msg')} (code={code})")
+    async def _find_current_axure_doc_id(self, project_id: str, team_id: str,
+                                         page_id: str = None) -> str:
+        """文档被替换后旧 docId 失效，通过 product_documents 定位当前有效 axure 文档。
 
-        return data.get('data') or data.get('result', {})
+        Args:
+            project_id: 项目 ID
+            team_id: 团队 ID（product_documents 必需）
+            page_id: 可选 pageId，多文档时按其跨版本稳定特性消歧
+
+        Returns:
+            当前有效的 axure 文档 id
+
+        Raises:
+            Exception: 项目下无 axure 文档，或多个候选且无法消歧时（错误信息含候选清单）
+        """
+        api_url = f"{BASE_URL}/api/project/product_documents"
+        response = await self.client.get(
+            api_url, params={'team_id': team_id, 'project_id': project_id}
+        )
+        response.raise_for_status()
+        data = response.json()
+        code = data.get('code')
+        if not (code == 0 or code == '0' or code == '00000'):
+            raise Exception(
+                f"product_documents 查询失败: {data.get('msg') or data.get('message')} (code={code})"
+            )
+
+        result = data.get('data') or data.get('result') or {}
+        axure_docs = [
+            r for r in (result.get('resources') or [])
+            if r.get('type') == 'axure' and r.get('id')
+        ]
+
+        if not axure_docs:
+            raise Exception(
+                f"项目 {project_id} 下未找到任何 axure 文档，原 docId 可能指向已被删除的文档。"
+            )
+
+        if len(axure_docs) == 1:
+            return axure_docs[0]['id']
+
+        # 多个 axure 文档：用 pageId 跨版本稳定特性消歧
+        if page_id:
+            for doc in axure_docs:
+                try:
+                    info = await self._fetch_image_info(project_id, doc['id'])
+                    versions = info.get('versions') or []
+                    json_url = versions[0].get('json_url') if versions else None
+                    if not json_url:
+                        continue
+                    resp = await self.client.get(json_url)
+                    resp.raise_for_status()
+                    if self._sitemap_contains_page(resp.json(), page_id):
+                        return doc['id']
+                except Exception:
+                    continue
+
+        # 无法消歧：列出候选供用户选择
+        candidates = '\n'.join(
+            f"  - docId={d['id']}  名称={d.get('name')}"
+            for d in axure_docs
+        )
+        raise Exception(
+            f"原 docId 已失效，且项目下存在 {len(axure_docs)} 个 axure 文档，无法自动定位：\n{candidates}\n"
+            "请改用 lanhu_list_product_documents 选定正确文档，或使用带正确 docId 的链接。"
+        )
+
+    @staticmethod
+    def _sitemap_contains_page(mapping: dict, page_id: str) -> bool:
+        """递归检查 sitemap 中是否存在指定 pageId 的节点。"""
+        nodes = list(mapping.get('sitemap', {}).get('rootNodes', []) or [])
+        while nodes:
+            node = nodes.pop()
+            if node.get('id') == page_id:
+                return True
+            nodes.extend(node.get('children', []) or [])
+        return False
 
     async def list_product_documents(self, team_id: str, project_id: str) -> dict:
         """获取项目下的所有产品文档(PRD/原型)列表。
@@ -2702,7 +2847,10 @@ class LanhuExtractor:
     async def get_pages_list(self, url: str) -> dict:
         """获取文档的所有页面列表（仅包含sitemap中的页面，与Web界面一致）"""
         params = self.parse_url(url)
-        doc_info = await self.get_document_info(params['project_id'], params['doc_id'])
+        doc_info = await self.get_document_info(
+            params['project_id'], params['doc_id'],
+            team_id=params.get('team_id'), page_id=params.get('page_id')
+        )
 
         # 获取项目详细信息（包含创建者等信息）
         project_info = None
@@ -2830,7 +2978,7 @@ class LanhuExtractor:
         
         # 构建返回结果
         result = {
-            'document_id': params['doc_id'],
+            'document_id': doc_info.get('id', params['doc_id']),
             'document_name': doc_info.get('name', 'Unknown'),
             'document_type': doc_info.get('type', 'axure'),
             'total_pages': len(pages_list),
@@ -2839,6 +2987,15 @@ class LanhuExtractor:
             'folder_statistics': dict(folder_stats),  # 每个文件夹下有多少页面（按纯Folder统计）
             'pages': pages_list
         }
+
+        # docId 迁移提示：原链接 docId 已失效，已自动定位到当前文档
+        if doc_info.get('_relocated_to_doc_id'):
+            result['doc_id_relocated'] = True
+            result['original_doc_id'] = doc_info.get('_relocated_from_doc_id')
+            result['relocation_note'] = (
+                "原链接中的 docId 已失效（文档被替换过），已自动定位到当前文档。"
+                f"建议更新链接为带 docId={doc_info.get('_relocated_to_doc_id')} 的新链接。"
+            )
 
         # 添加时间信息
         if doc_info.get('create_time'):
@@ -2882,7 +3039,10 @@ class LanhuExtractor:
             }
         """
         params = self.parse_url(url)
-        doc_info = await self.get_document_info(params['project_id'], params['doc_id'])
+        doc_info = await self.get_document_info(
+            params['project_id'], params['doc_id'],
+            team_id=params.get('team_id'), page_id=params.get('page_id')
+        )
 
         # 获取项目级mapping JSON
         versions = doc_info.get('versions', [])
